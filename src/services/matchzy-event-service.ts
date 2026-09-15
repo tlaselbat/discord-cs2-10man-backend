@@ -49,6 +49,16 @@ export class MatchZyEventService {
             },
           });
         }
+        await transaction.job.upsert({
+          where: { idempotencyKey: `panel:${matchId}:event:${journal.id}` },
+          update: {},
+          create: {
+            matchId,
+            type: 'PANEL_REFRESH',
+            idempotencyKey: `panel:${matchId}:event:${journal.id}`,
+            payload: { matchId },
+          },
+        });
         if (event.event === 'series_end') {
           await transaction.job.upsert({
             where: { idempotencyKey: `cleanup:${matchId}` },

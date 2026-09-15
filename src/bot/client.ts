@@ -3,6 +3,7 @@ import {
   Events,
   GatewayIntentBits,
   GuildMemberRoleManager,
+  PermissionFlagsBits,
   REST,
   Routes,
   type ChatInputCommandInteraction,
@@ -19,14 +20,24 @@ import { DiagnosticsService } from '../services/diagnostics-service.js';
 import { PanelService } from '../services/panel-service.js';
 import { renderMatchPanel } from './panel.js';
 import { commands } from './commands.js';
-import { buildMatchControls } from './components.js';
+import { buildMatchControls, buildTeamChoiceControls } from './components.js';
 import { parseCustomId } from './custom-id.js';
 import { assertAuthorized, type ActorContext } from '../domain/authorization.js';
+import type { Logger } from 'pino';
+import { publicMessage } from '../errors/public-error.js';
+import { parseMatchScore } from '../domain/score.js';
+import { GuildResourceService, type ManagedPreview } from '../services/guild-resource-service.js';
+import { adminGeneration, parseAdminCustomId } from './admin-custom-id.js';
+import { buildAdminConfirmationControls } from './admin-components.js';
 
 async function fetchAllowedProfiles(
   prisma: PrismaClient,
 ): Promise<{ key: string; label: string }[]> {
-  const profiles = await prisma.gameProfile.findMany({ select: { key: true } });
+  const profiles = await prisma.gameProfile.findMany({
+    where: { enabled: true },
+    orderBy: { key: 'asc' },
+    select: { key: true },
+  });
   return profiles.map((profile) => ({ key: profile.key, label: profile.key }));
 }
 
@@ -40,6 +51,7 @@ export interface BotDependencies {
   dathost: DatHostClient;
   cipher: CredentialCipher;
   componentSigningSecret: string;
+  logger: Logger;
 }
 
 export async function registerCommands(token: string, clientId: string): Promise<void> {
@@ -52,18 +64,37 @@ export function createDiscordClient(dependencies: BotDependencies): Client {
     intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildVoiceStates],
   });
   const guildSettingsService = new GuildSettingsService(dependencies.prisma, client);
+  const guildResourceService = new GuildResourceService(
+    dependencies.prisma,
+    client,
+    dependencies.logger,
+  );
   client.on(Events.InteractionCreate, (interaction) => {
     if (!interaction.isChatInputCommand() && !interaction.isMessageComponent()) return;
     const operation = interaction.isChatInputCommand()
-      ? handleCommand(interaction, dependencies, client, guildSettingsService)
-      : handleComponent(interaction, dependencies, dependencies.matchControlService);
-    void operation.catch(async () => {
-      const message = {
-        content: 'The action could not be completed. Refresh `/10man status` and try again.',
-        ephemeral: true,
-      } as const;
-      if (interaction.deferred || interaction.replied) await interaction.followUp(message);
-      else await interaction.reply(message);
+      ? handleCommand(interaction, dependencies, client, guildSettingsService, guildResourceService)
+      : interaction.customId.startsWith('tma:')
+        ? handleAdminComponent(interaction, dependencies, guildResourceService)
+        : handleComponent(interaction, dependencies, dependencies.matchControlService);
+    void operation.catch(async (error: unknown) => {
+      dependencies.logger.error(
+        {
+          err: error,
+          interactionId: interaction.id,
+          guildId: interaction.guildId,
+          userId: interaction.user.id,
+          commandName: interaction.isChatInputCommand() ? interaction.commandName : undefined,
+        },
+        'Discord interaction failed',
+      );
+      const content = publicMessage(error, interaction.id);
+      if (interaction.deferred) {
+        await interaction.editReply({ content, components: [] }).catch(() => undefined);
+      } else if (interaction.replied) {
+        await interaction.followUp({ content, ephemeral: true }).catch(() => undefined);
+      } else {
+        await interaction.reply({ content, ephemeral: true }).catch(() => undefined);
+      }
     });
   });
   return client;
@@ -74,13 +105,17 @@ async function handleCommand(
   dependencies: BotDependencies,
   client: Client,
   guildSettingsService: GuildSettingsService,
+  guildResourceService: GuildResourceService,
 ): Promise<void> {
   if (interaction.guildId === null) throw new Error('Guild command required');
-  if (interaction.commandName === 'steam' && interaction.options.getSubcommand() === 'register') {
+  await interaction.deferReply({ ephemeral: true });
+  if (
+    interaction.commandName === 'steam' &&
+    ['register', 'replace'].includes(interaction.options.getSubcommand())
+  ) {
     const challenge = await dependencies.steamLinkService.createChallenge(interaction.user.id);
-    await interaction.reply({
+    await interaction.editReply({
       content: `Verify Steam ownership: ${challenge.startUrl.toString()}`,
-      ephemeral: true,
     });
     return;
   }
@@ -89,12 +124,11 @@ async function handleCommand(
       where: { discordUserId: interaction.user.id, invalidatedAt: null },
       select: { steamId64: true, verifiedAt: true },
     });
-    await interaction.reply({
+    await interaction.editReply({
       content:
         identity === null
           ? 'No verified Steam account.'
           : `Verified SteamID64: ${identity.steamId64}`,
-      ephemeral: true,
     });
     return;
   }
@@ -121,21 +155,32 @@ async function handleCommand(
     ) {
       throw new Error('Privileged role required');
     }
+    if (settings.lobbyTextChannelId === null)
+      throw new Error('Lobby text channel is not configured');
+    const lobbyChannel = await client.channels.fetch(settings.lobbyTextChannelId);
+    if (lobbyChannel === null || !lobbyChannel.isTextBased() || lobbyChannel.isDMBased()) {
+      throw new Error('Configured lobby text channel is unavailable');
+    }
     const matchId = await dependencies.matchService.create({
       guildId: interaction.guildId,
       leaderDiscordUserId: interaction.user.id,
       displayName: interaction.user.globalName ?? interaction.user.username,
       correlationId: interaction.id,
     });
-    if (interaction.channel !== null) {
-      const panelService = new PanelService(
-        dependencies.prisma,
-        client,
-        dependencies.componentSigningSecret,
-      );
-      await panelService.publishInitialPanel(matchId, interaction.channel);
+    const panelService = new PanelService(
+      dependencies.prisma,
+      client,
+      dependencies.componentSigningSecret,
+    );
+    try {
+      const published = await panelService.publishInitialPanel(matchId, lobbyChannel);
+      await interaction.editReply({
+        content: `10man created in <#${published.channelId}>: ${matchId}`,
+      });
+    } catch (error: unknown) {
+      await dependencies.matchService.failUnpublishedMatch(matchId, interaction.id);
+      throw error;
     }
-    await interaction.reply({ content: `10man created: ${matchId}`, ephemeral: true });
     return;
   }
   if (interaction.commandName === '10man' && interaction.options.getSubcommand() === 'cancel') {
@@ -143,7 +188,7 @@ async function handleCommand(
     if (match === null) throw new Error('No active match');
     const actor = await createActorContext(interaction, match.id, dependencies.prisma);
     await dependencies.matchService.cancel(match.id, actor, interaction.id);
-    await interaction.reply({
+    await interaction.editReply({
       content: 'The match was canceled. Cleanup status is available in `/10man status`.',
     });
     return;
@@ -151,7 +196,7 @@ async function handleCommand(
   if (interaction.commandName === '10man' && interaction.options.getSubcommand() === 'status') {
     const match = await dependencies.matchService.findGuildMatch(interaction.guildId);
     if (match === null) {
-      await interaction.reply({ content: 'There is no active 10man.', ephemeral: true });
+      await interaction.editReply({ content: 'There is no active 10man.' });
       return;
     }
     const panel = renderMatchPanel({
@@ -169,10 +214,10 @@ async function handleCommand(
       team2: match.players
         .filter((player) => player.team === 'TEAM_2')
         .map((player) => player.displayNameSnapshot),
-      score: null,
+      score: parseMatchScore(match.score),
     });
     const allowedProfiles = await fetchAllowedProfiles(dependencies.prisma);
-    await interaction.reply({
+    await interaction.editReply({
       embeds: [panel],
       components: buildMatchControls({
         matchId: match.id,
@@ -182,7 +227,6 @@ async function handleCommand(
         allowedProfiles,
         secret: dependencies.componentSigningSecret,
       }),
-      ephemeral: true,
     });
     return;
   }
@@ -194,9 +238,8 @@ async function handleCommand(
       if (match === null) throw new Error('No active match');
       const actor = await createActorContext(interaction, match.id, dependencies.prisma);
       await dependencies.matchService.transferLeader(match.id, target.id, actor, interaction.id);
-      await interaction.reply({
+      await interaction.editReply({
         content: `Leader transferred to <@${target.id}>.`,
-        ephemeral: true,
       });
       return;
     }
@@ -206,9 +249,8 @@ async function handleCommand(
       if (match === null) throw new Error('No active match');
       const actor = await createActorContext(interaction, match.id, dependencies.prisma);
       await dependencies.matchService.removeParticipant(match.id, target.id, actor, interaction.id);
-      await interaction.reply({
+      await interaction.editReply({
         content: `<@${target.id}> removed from the match.`,
-        ephemeral: true,
       });
       return;
     }
@@ -221,24 +263,114 @@ async function handleCommand(
         where: { guildId: interaction.guildId },
       });
       if (settings === null) {
-        await interaction.reply({
+        await interaction.editReply({
           content: 'This server is not configured. Use `/match admin configure`.',
-          ephemeral: true,
         });
         return;
       }
-      await interaction.reply({
+      await interaction.editReply({
         content:
           `10man configured: ${settings.enabled ? 'enabled' : 'disabled'}\n` +
           `Template: ${settings.dathostTemplateServerId ?? 'unset'}\n` +
           `Location: ${settings.defaultServerLocation ?? 'unset'}\n` +
-          `Profile: ${settings.defaultGameProfileKey ?? 'unset'}`,
-        ephemeral: true,
+          `Profile: ${settings.defaultGameProfileKey ?? 'unset'}\n` +
+          `Managed resources: ${settings.managedResourceState}${settings.managedSetupStep === null ? '' : ` (${settings.managedSetupStep})`}`,
+      });
+      return;
+    }
+    if (subcommand === 'setup') {
+      const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
+      assertAuthorized('SETUP_GUILD', adminActor);
+      const result = await guildResourceService.setup({
+        guildId: interaction.guildId,
+        actorDiscordUserId: interaction.user.id,
+        correlationId: interaction.id,
+        ...(interaction.options.getRole('privileged_role')?.id === undefined
+          ? {}
+          : { privilegedRoleId: interaction.options.getRole('privileged_role', true).id }),
+        ...(interaction.options.getRole('moderator_role')?.id === undefined
+          ? {}
+          : { moderatorRoleId: interaction.options.getRole('moderator_role', true).id }),
+        ...(interaction.options.getRole('administrator_role')?.id === undefined
+          ? {}
+          : { administratorRoleId: interaction.options.getRole('administrator_role', true).id }),
+        ...(interaction.options.getString('dathost_template_server_id') === null
+          ? {}
+          : {
+              dathostTemplateServerId: interaction.options.getString(
+                'dathost_template_server_id',
+                true,
+              ),
+            }),
+        ...(interaction.options.getString('dathost_location') === null
+          ? {}
+          : { defaultServerLocation: interaction.options.getString('dathost_location', true) }),
+        ...(interaction.options.getString('default_game_profile') === null
+          ? {}
+          : {
+              defaultGameProfileKey: interaction.options.getString('default_game_profile', true),
+            }),
+      });
+      await interaction.editReply({
+        content: `Managed 10man channels created in <#${result.categoryId ?? ''}>. Run \`/match admin diagnostics\` to verify setup.`,
+      });
+      return;
+    }
+    if (subcommand === 'disable') {
+      const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
+      assertAuthorized('DISABLE_GUILD', adminActor);
+      const changed = await guildResourceService.disable(
+        interaction.guildId,
+        interaction.user.id,
+        interaction.id,
+      );
+      await interaction.editReply({
+        content: changed ? 'New 10man creation is disabled.' : 'This server is already disabled.',
+      });
+      return;
+    }
+    if (subcommand === 'enable') {
+      const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
+      assertAuthorized('ENABLE_GUILD', adminActor);
+      const changed = await guildResourceService.enable(
+        interaction.guildId,
+        interaction.user.id,
+        interaction.id,
+      );
+      await interaction.editReply({
+        content: changed ? '10man creation is enabled.' : 'This server is already enabled.',
+      });
+      return;
+    }
+    if (subcommand === 'teardown' || subcommand === 'recover-setup') {
+      const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
+      assertAuthorized(
+        subcommand === 'teardown' ? 'TEARDOWN_GUILD' : 'RECOVER_GUILD_SETUP',
+        adminActor,
+      );
+      const preview =
+        subcommand === 'teardown'
+          ? await guildResourceService.teardownPreview(interaction.guildId)
+          : await guildResourceService.recoverPreview(interaction.guildId);
+      const generation = adminGeneration(preview.attemptId, preview.settingsVersion);
+      await interaction.editReply({
+        content: formatManagedPreview(preview, subcommand === 'teardown'),
+        components: buildAdminConfirmationControls(
+          {
+            guildId: interaction.guildId,
+            actorDiscordUserId: interaction.user.id,
+            settingsVersion: preview.settingsVersion,
+            generation,
+            expiresAt: Math.floor(Date.now() / 1000) + 5 * 60,
+          },
+          dependencies.componentSigningSecret,
+          subcommand === 'teardown' ? 'teardown' : 'recovery',
+        ),
       });
       return;
     }
     if (subcommand === 'configure') {
-      const adminActor = await createActorContext(interaction, '', dependencies.prisma);
+      const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
       assertAuthorized('CONFIGURE_GUILD', adminActor);
       const lobbyTextChannel = interaction.options.getChannel('lobby_text_channel', true);
       const lobbyVoiceChannel = interaction.options.getChannel('lobby_voice_channel', true);
@@ -265,7 +397,7 @@ async function handleCommand(
         ...(defaultServerLocation === undefined ? {} : { defaultServerLocation }),
         ...(defaultGameProfileKey === undefined ? {} : { defaultGameProfileKey }),
       });
-      await interaction.reply({ content: '10man configuration saved.', ephemeral: true });
+      await interaction.editReply({ content: '10man configuration saved.' });
       return;
     }
     if (subcommand === 'diagnostics') {
@@ -276,18 +408,72 @@ async function handleCommand(
         client,
         dependencies.dathost,
       ).runGuildDiagnostics(interaction.guildId);
-      await interaction.reply({
-        content: formatDiagnosticsReport(report),
-        ephemeral: true,
-      });
+      await interaction.editReply({ content: formatDiagnosticsReport(report) });
       return;
     }
   }
 
-  await interaction.reply({
+  await interaction.editReply({
     content: 'This command is not available in the current state.',
-    ephemeral: true,
   });
+}
+
+async function handleAdminComponent(
+  interaction: MessageComponentInteraction,
+  dependencies: BotDependencies,
+  guildResourceService: GuildResourceService,
+): Promise<void> {
+  if (interaction.guildId === null) throw new Error('Guild interaction required');
+  await interaction.deferUpdate();
+  const payload = parseAdminCustomId(interaction.customId, dependencies.componentSigningSecret);
+  if (
+    payload.guildId !== interaction.guildId ||
+    payload.actorDiscordUserId !== interaction.user.id
+  ) {
+    throw new Error('Administrative confirmation does not belong to this interaction');
+  }
+  const adminActor = await createGuildAdminActor(interaction, dependencies.prisma);
+  assertAuthorized(
+    payload.action === 'TC' || payload.action === 'TX' ? 'TEARDOWN_GUILD' : 'RECOVER_GUILD_SETUP',
+    adminActor,
+  );
+  if (payload.action === 'TX' || payload.action === 'RX') {
+    await interaction.editReply({ content: 'Administrative action canceled.', components: [] });
+    return;
+  }
+  const preview =
+    payload.action === 'TC'
+      ? await guildResourceService.teardownPreview(interaction.guildId)
+      : await guildResourceService.recoverPreview(interaction.guildId);
+  if (
+    preview.settingsVersion !== payload.settingsVersion ||
+    adminGeneration(preview.attemptId, preview.settingsVersion) !== payload.generation
+  ) {
+    throw new Error('Administrative confirmation is stale');
+  }
+  if (payload.action === 'TC') {
+    await guildResourceService.teardown(
+      interaction.guildId,
+      interaction.user.id,
+      interaction.id,
+      payload.settingsVersion,
+    );
+    await interaction.editReply({
+      content: 'Managed 10man channels were removed.',
+      components: [],
+    });
+  } else {
+    await guildResourceService.recoverSetup(
+      interaction.guildId,
+      interaction.user.id,
+      interaction.id,
+      payload.settingsVersion,
+    );
+    await interaction.editReply({
+      content: 'Managed setup recovery completed. You can run `/match admin setup` again.',
+      components: [],
+    });
+  }
 }
 
 async function handleComponent(
@@ -297,6 +483,9 @@ async function handleComponent(
 ): Promise<void> {
   if (interaction.guildId === null) throw new Error('Guild interaction required');
   const payload = parseCustomId(interaction.customId, dependencies.componentSigningSecret);
+  const privateResponse = ['GET_CONNECT_INFO', 'SELECT_TEAM_PARTICIPANT'].includes(payload.action);
+  if (privateResponse) await interaction.deferReply({ ephemeral: true });
+  else await interaction.deferUpdate();
   const match = await dependencies.matchService.findGuildMatch(interaction.guildId);
   if (match === null || match.id !== payload.matchId) throw new Error('Match is no longer active');
   const actor = await createActorContext(interaction, match.id, dependencies.prisma);
@@ -345,11 +534,25 @@ async function handleComponent(
       payload.version,
       interaction.id,
     );
-  } else if (
-    (payload.action === 'ASSIGN_TEAM_1' || payload.action === 'ASSIGN_TEAM_2') &&
-    interaction.isUserSelectMenu()
-  ) {
+  } else if (payload.action === 'SELECT_TEAM_PARTICIPANT' && interaction.isUserSelectMenu()) {
+    assertAuthorized('ORGANIZE_TEAMS', actor, authContext);
     const target = interaction.values[0];
+    if (target === undefined) throw new Error('Player selection is missing');
+    if (!match.players.some((player) => player.discordUserId === target)) {
+      throw new Error('Selected user is not a participant');
+    }
+    await interaction.editReply({
+      content: `Choose a team for <@${target}>.`,
+      components: buildTeamChoiceControls(
+        match.id,
+        payload.version,
+        target,
+        dependencies.componentSigningSecret,
+      ),
+    });
+    return;
+  } else if (payload.action === 'ASSIGN_TEAM_1' || payload.action === 'ASSIGN_TEAM_2') {
+    const target = payload.targetDiscordUserId;
     if (target === undefined) throw new Error('Player selection is missing');
     await dependencies.matchService.assignTeam(
       match.id,
@@ -390,9 +593,8 @@ async function handleComponent(
       matchWithConnection.encryptedJoinPassword,
       `join:${match.id}:${matchWithConnection.dathostServerId}`,
     );
-    await interaction.reply({
+    await interaction.editReply({
       content: `\`connect ${matchWithConnection.dathostIp}:${String(matchWithConnection.dathostPort)}; password ${password}\``,
-      ephemeral: true,
     });
     return;
   } else if (payload.action === 'FORCE_START') {
@@ -418,7 +620,6 @@ async function handleComponent(
     throw new Error('Unsupported match control');
   }
 
-  await interaction.deferUpdate();
   const updated = await dependencies.matchService.findGuildMatch(interaction.guildId);
   if (updated === null) {
     await interaction.editReply({
@@ -446,7 +647,7 @@ async function handleComponent(
         team2: updated.players
           .filter((player) => player.team === 'TEAM_2')
           .map((player) => player.displayNameSnapshot),
-        score: null,
+        score: parseMatchScore(match.score),
       }),
     ],
     components: buildMatchControls({
@@ -460,6 +661,15 @@ async function handleComponent(
   });
 }
 
+function formatManagedPreview(preview: ManagedPreview, teardown: boolean): string {
+  const ids = [preview.categoryId, ...preview.channelIds].filter((id): id is string => id !== null);
+  const resources =
+    ids.length === 0 ? 'No persisted resources.' : ids.map((id) => `<#${id}>`).join('\n');
+  return teardown
+    ? `This permanently deletes these bot-managed Discord resources:\n${resources}\n\nConfirm within five minutes.`
+    : `Interrupted setup step: ${preview.setupStep ?? 'unknown'}\nPersisted resources:\n${resources}\n\nInspect Discord for any untracked resource from the interrupted step, remove it manually, then acknowledge within five minutes.`;
+}
+
 function formatDiagnosticsReport(report: {
   configured: boolean;
   enabled: boolean;
@@ -468,6 +678,14 @@ function formatDiagnosticsReport(report: {
   permissions: { label: string; ok: boolean; missing?: string[] }[];
   template?: { id: string; ok: boolean; error?: string };
   activeMatch?: { id: string; state: string; cleanupStatus: string } | null;
+  managed?: {
+    state: string;
+    setupStep: string | null;
+    categoryId: string | null;
+    channelIds: string[];
+    manageChannels: boolean;
+    createdAt: Date | null;
+  };
 }): string {
   if (!report.configured) return 'This server is not configured. Use `/match admin configure`.';
   const status = (ok: boolean) => (ok ? 'OK' : 'FAIL');
@@ -493,12 +711,47 @@ function formatDiagnosticsReport(report: {
       `Template server: ${status(report.template.ok)}${report.template.error ? ` (${report.template.error})` : ''}`,
     );
   }
+  if (report.managed !== undefined) {
+    lines.push(
+      `Managed resources: ${report.managed.state}${report.managed.setupStep === null ? '' : ` (${report.managed.setupStep})`}`,
+      `Manage Channels: ${status(report.managed.manageChannels)}`,
+    );
+  }
   if (report.activeMatch !== undefined) {
     lines.push(
       `Active match: ${report.activeMatch === null ? 'none' : `${report.activeMatch.state} (cleanup: ${report.activeMatch.cleanupStatus})`}`,
     );
   }
   return lines.join('\n');
+}
+
+async function createGuildAdminActor(
+  interaction: ChatInputCommandInteraction | MessageComponentInteraction,
+  prisma: PrismaClient,
+): Promise<ActorContext> {
+  if (interaction.guildId === null) throw new Error('Guild interaction required');
+  const settings = await prisma.guildSettings.findUnique({
+    where: { guildId: interaction.guildId },
+  });
+  const nativeAdministrator =
+    interaction.memberPermissions?.has(PermissionFlagsBits.Administrator) ?? false;
+  const roles = interaction.member?.roles;
+  const memberRoles =
+    roles === undefined
+      ? []
+      : roles instanceof GuildMemberRoleManager
+        ? [...roles.cache.keys()]
+        : roles;
+  return {
+    discordUserId: interaction.user.id,
+    isParticipant: false,
+    isPrivilegedMember: false,
+    isModerator: false,
+    isAdministrator:
+      nativeAdministrator ||
+      (settings !== null &&
+        memberRoles.some((role) => settings.administratorRoleIds.includes(role))),
+  };
 }
 
 async function createActorContext(

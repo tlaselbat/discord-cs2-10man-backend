@@ -101,17 +101,8 @@ export function buildMatchControls(
       new ActionRowBuilder<UserSelectMenuBuilder>()
         .addComponents(
           new UserSelectMenuBuilder()
-            .setCustomId(id('ASSIGN_TEAM_1'))
-            .setPlaceholder('Assign participant to Team 1')
-            .setMinValues(1)
-            .setMaxValues(1),
-        )
-        .toJSON(),
-      new ActionRowBuilder<UserSelectMenuBuilder>()
-        .addComponents(
-          new UserSelectMenuBuilder()
-            .setCustomId(id('ASSIGN_TEAM_2'))
-            .setPlaceholder('Assign participant to Team 2')
+            .setCustomId(id('SELECT_TEAM_PARTICIPANT'))
+            .setPlaceholder('Choose participant to assign')
             .setMinValues(1)
             .setMaxValues(1),
         )
@@ -174,7 +165,7 @@ export function buildMatchControls(
             .setCustomId(id('RESTORE_ROUND'))
             .setPlaceholder('Restore round')
             .addOptions(
-              Array.from({ length: 30 }, (_, index) => {
+              Array.from({ length: 25 }, (_, index) => {
                 const round = String(index + 1);
                 return { label: `Round ${round}`, value: round };
               }),
@@ -185,4 +176,28 @@ export function buildMatchControls(
   }
 
   return rows;
+}
+
+export function buildTeamChoiceControls(
+  matchId: string,
+  version: number,
+  targetDiscordUserId: string,
+  secret: string,
+): APIActionRowComponent<APIComponentInMessageActionRow>[] {
+  const id = (action: string): string =>
+    createCustomId({ action, matchId, version, targetDiscordUserId }, secret);
+  return [
+    new ActionRowBuilder<ButtonBuilder>()
+      .addComponents(
+        new ButtonBuilder()
+          .setCustomId(id('ASSIGN_TEAM_1'))
+          .setLabel('Team 1')
+          .setStyle(ButtonStyle.Primary),
+        new ButtonBuilder()
+          .setCustomId(id('ASSIGN_TEAM_2'))
+          .setLabel('Team 2')
+          .setStyle(ButtonStyle.Primary),
+      )
+      .toJSON(),
+  ];
 }

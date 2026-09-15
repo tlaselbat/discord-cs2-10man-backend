@@ -3,58 +3,96 @@
 ## Overview
 
 ```text
-Discord manages users and human workflow.
-The backend manages orchestration and authorization.
+Discord manages users and the human workflow.
+The backend owns authorization, state transitions, and orchestration.
+PostgreSQL provides durable state, jobs, audit history, and concurrency guarantees.
 DatHost manages disposable server infrastructure.
-MatchZy manages the actual CS2 match.
-CS2 executes gameplay.
+MatchZy manages the CS2 match and reports authenticated events.
 ```
 
 ## Runtime components
 
-| Component            | Responsibility                                                                   |
-| -------------------- | -------------------------------------------------------------------------------- |
-| Discord bot          | Slash commands, buttons, persistent panel, voice movement                        |
-| Fastify HTTP service | Health checks, Steam OpenID callback, MatchZy webhooks, config endpoint          |
-| Worker runner        | Leases durable jobs from PostgreSQL and executes handlers                        |
-| PostgreSQL           | Match state, jobs, credentials, events, audit log                                |
-| DatHost client       | Disposable server lifecycle (duplicate, configure, start, stop, delete, console) |
-| MatchZy integration  | Config builder, event ingestion, semantic command allowlist                      |
+| Component            | Responsibility                                                                                   |
+| -------------------- | ------------------------------------------------------------------------------------------------ |
+| Discord bot          | Slash commands, signed components, persistent panels, private connection details, voice movement |
+| Fastify HTTP service | Health checks, Steam OpenID, authenticated MatchZy config and webhook endpoints                  |
+| Worker runner        | Exclusively leases durable jobs and executes one polling cycle at a time                         |
+| PostgreSQL           | Match state, one-active-slot invariant, jobs, credentials, events, audit history                 |
+| DatHost client       | Disposable server creation, duplication, configuration, lifecycle, and console commands          |
+| MatchZy integration  | Config builder, event ingestion, score updates, reconciliation, semantic command allowlist       |
+
+Slash command definitions are deployed explicitly with `pnpm discord:register`; application startup does not modify global Discord commands.
+
+## Guild and match invariants
+
+- PostgreSQL enforces at most one row with `guild_slot_active = true` per guild through the migration-owned partial unique index `matches_one_active_slot_per_guild`.
+- Match creation also takes a guild-scoped advisory transaction lock so concurrent callers receive a deterministic conflict.
+- The persistent panel is published only in the configured lobby text channel. If initial publication fails, the new match is compensated to `FAILED` and its slot is released because no external server exists.
+- A terminal match can continue to hold the guild slot while external cleanup is pending. Cleanup completion releases it.
+- Enabled game profiles determine lobby capacity. Profile changes reject over-capacity rosters and reset team assignments; they also clear a map that the new profile does not allow.
 
 ## State machines
 
 ### Match state
 
+Normal progression:
+
 `CREATED → OPEN → FULL → TEAM_SETUP → TEAMS_LOCKED → SERVER_PROVISIONING → SERVER_BOOTING → SERVER_READY → MATCH_LOADED → WARMUP → LIVE ↔ PAUSED → FINISHED`
 
-Terminal states: `FINISHED`, `CANCELED`, `FAILED`.
+Roster or profile changes can return `FULL` or `TEAM_SETUP` to `OPEN`. A profile change at exact capacity produces `FULL`.
+
+Terminal states are `FINISHED`, `CANCELED`, and `FAILED`. Exhausted provisioning or boot retries move the match to `FAILED`, preserve a safe failure reason, and queue cleanup when a DatHost resource may exist.
 
 ### Cleanup state
 
 `NOT_REQUIRED → PENDING → RUNNING → RETRY → COMPLETE`
 
-Cleanup is independent of match outcome and runs on a separate state machine. A new match is blocked while a guild slot's cleanup is not `COMPLETE`.
+Cleanup is independent of the match outcome. It revokes match credentials, returns participants to lobby voice, and safely deletes only the owned disposable server. A missing disposable server is treated as successful cleanup.
 
 ### Provisioning attempt state
 
 `DUPLICATE_REQUEST_PENDING → DUPLICATE_OUTCOME_UNKNOWN → SERVER_IDENTIFIED → COMPLETE`
 
-Ambiguous outcomes require operator review and do not auto-retry.
+An ambiguous duplicate outcome requires operator review. Unknown or ambiguous outcomes are treated conservatively: the guild slot is not released until ownership and cleanup are resolved.
 
-## Job types
+## Durable jobs
 
-- `PROVISION_SERVER` — create/reconcile DatHost destination, configure, start
-- `POLL_SERVER_BOOT` — poll DatHost until the server reports `booting=false`
-- `VOICE_RECONCILE` — move Discord users to correct voice channels
-- `PANEL_REFRESH` — update the persistent match panel
-- `CLEANUP_MATCH` — revoke credentials, return users to lobby, delete server
-- `ORPHAN_SCAN` — list DatHost servers and report unaccounted resources
-- `MATCHZY_RECONCILE` — recover from missed `series_end` or stale events
+| Job                 | Behavior                                                                                       |
+| ------------------- | ---------------------------------------------------------------------------------------------- |
+| `PROVISION_SERVER`  | Creates or reconciles a destination, duplicates/configures the template, and starts the server |
+| `POLL_SERVER_BOOT`  | Polls DatHost, persists `SERVER_READY`, loads MatchZy, then persists `MATCH_LOADED`            |
+| `VOICE_RECONCILE`   | Moves Discord participants to the voice channel matching their team                            |
+| `PANEL_REFRESH`     | Re-renders the persistent panel, including current score and controls                          |
+| `CLEANUP_MATCH`     | Revokes credentials, restores lobby voice, and deletes the owned server                        |
+| `ORPHAN_SCAN`       | Periodically reports DatHost resources that are not accounted for                              |
+| `MATCHZY_RECONCILE` | Periodically recovers missed terminal events and records stale-event observations              |
+
+Handlers return either completion or a future reschedule time. Recurring jobs are reset to `PENDING` with their next `run_at`; they are not marked complete after rescheduling. Startup recovery reactivates recurring singleton jobs and resumes unfinished matches. The runner prevents overlapping `runOnce` calls and waits for in-flight work during shutdown.
+
+## Managed guild resources
+
+Managed setup persists a guild attempt and an explicit create-in-flight step before each Discord API request. The transaction commits before Discord is awaited; the returned ID is persisted in a new short version-checked transaction. Accepted-but-unpersisted creates remain explicitly ambiguous and are never adopted or deleted by name. `/match admin recover-setup` requires operator inspection/manual cleanup and signed acknowledgement.
+
+Managed teardown is actor/guild/version/generation-bound, expires after five minutes, refuses active guild slots, clears functional IDs before deletion, and progressively deletes tracked children before the category. Partial work remains disabled and retryable. Manual channels have no managed ownership and cannot be deleted through teardown. `managedResourcesCreatedAt` exists only while active ownership exists; audits retain lifecycle history.
+
+Soft disable prevents only new match creation. Existing match components, MatchZy events, workers, completion, and cleanup continue.
+
+## Discord interaction model
+
+- Commands are deferred ephemerally before database or external I/O.
+- Panel mutations defer the source-message update immediately.
+- Private operations such as connect information and the second team-assignment step use ephemeral replies.
+- Team assignment uses one participant selector followed by signed ephemeral Team 1 / Team 2 buttons, keeping every panel at or below Discord's five-row limit.
+- Component IDs are HMAC-signed and bind action, match ID, match version, and, when applicable, the target Discord user ID.
+- Expected failures return safe actionable messages. Unexpected failures return a correlation reference while structured logs retain internal details.
 
 ## Security model
 
 - No raw Discord-to-RCON path exists.
 - MatchZy commands are allowlisted and rendered in `src/integrations/matchzy/commands.ts`.
-- MatchZy tokens are scoped (`CONFIG_READ` / `EVENT_WRITE`) and bound to a match + server generation.
-- Credentials are AES-256-GCM encrypted and hashed in the database.
-- DatHost template IDs are never deleted or reconfigured by the bot.
+- MatchZy tokens are scoped (`CONFIG_READ` or `EVENT_WRITE`) and bound to a match and server generation.
+- RCON and join passwords are encrypted with AES-256-GCM; tokens are stored as hashes.
+- Steam OpenID sessions are random, hashed, expiring, and single-use.
+- DatHost template IDs are protected from reconfiguration and deletion by ownership checks.
+- Connection commands, Steam links, diagnostics, and interaction errors are ephemeral.
+- Pino redaction covers configured token, password, and authorization fields.

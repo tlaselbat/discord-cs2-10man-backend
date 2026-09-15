@@ -37,6 +37,14 @@ export class GuildSettingsService {
   ) {}
 
   public async update(command: UpdateGuildSettingsCommand): Promise<void> {
+    const existing = await this.prisma.guildSettings.findUnique({
+      where: { guildId: command.guildId },
+    });
+    if (existing !== null && existing.managedResourceState !== 'NONE') {
+      throw new Error(
+        'Managed channels must be torn down or recovered before manual configuration',
+      );
+    }
     const guild = await this.client.guilds.fetch(command.guildId);
     const botMember = guild.members.me ?? (await guild.members.fetch(this.client.user?.id ?? ''));
 
@@ -112,7 +120,8 @@ export class GuildSettingsService {
 
     const profileKey = command.defaultGameProfileKey ?? 'competitive_5v5';
     const profile = await this.prisma.gameProfile.findUnique({ where: { key: profileKey } });
-    if (profile === null) throw new Error(`Game profile ${profileKey} does not exist`);
+    if (profile === null || !profile.enabled)
+      throw new Error(`Game profile ${profileKey} does not exist or is disabled`);
 
     await this.prisma.$transaction(async (transaction) => {
       await transaction.guildSettings.upsert({

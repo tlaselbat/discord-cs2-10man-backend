@@ -8,11 +8,15 @@ export interface LeasedJob {
 export interface JobStore {
   lease(workerId: string, leaseUntil: Date): Promise<LeasedJob | null>;
   complete(jobId: string): Promise<void>;
+  reschedule(jobId: string, runAt: Date): Promise<void>;
   retry(jobId: string, runAt: Date, error: string): Promise<void>;
   fail(jobId: string, error: string): Promise<void>;
 }
 
-export type JobHandler = (job: LeasedJob) => Promise<void>;
+export type JobResult = { rescheduleAt: Date } | undefined;
+export type JobHandler = ((job: LeasedJob) => Promise<JobResult> | Promise<void>) & {
+  onPermanentFailure?: (job: LeasedJob, error: string) => Promise<void>;
+};
 
 export interface WorkerOptions {
   workerId: string;
@@ -41,13 +45,29 @@ export class DurableWorker {
       return true;
     }
     try {
-      await handler(job);
-      await this.store.complete(job.id);
+      const result = await handler(job);
+      if (result === undefined) await this.store.complete(job.id);
+      else await this.store.reschedule(job.id, result.rescheduleAt);
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : 'Unknown job error';
       const nextAttempt = job.attempts + 1;
-      if (nextAttempt >= this.options.maxAttempts) await this.store.fail(job.id, message);
-      else {
+      if (nextAttempt >= this.options.maxAttempts) {
+        if (handler.onPermanentFailure !== undefined) {
+          try {
+            await handler.onPermanentFailure(job, message);
+          } catch (recoveryError: unknown) {
+            const recoveryMessage =
+              recoveryError instanceof Error ? recoveryError.message : 'Unknown recovery error';
+            await this.store.retry(
+              job.id,
+              new Date(now.getTime() + this.options.maxRetryMs),
+              `Permanent failure recovery failed: ${recoveryMessage}`,
+            );
+            return true;
+          }
+        }
+        await this.store.fail(job.id, message);
+      } else {
         const exponential = this.options.baseRetryMs * 2 ** Math.max(0, nextAttempt - 1);
         const delay = Math.min(exponential, this.options.maxRetryMs);
         await this.store.retry(job.id, new Date(now.getTime() + delay), message);

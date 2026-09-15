@@ -25,6 +25,7 @@ export interface WorkerDependencies {
   templateServerIds: ReadonlySet<string>;
   componentSigningSecret: string;
   matchzyStaleAfterMs: number;
+  matchzyReconciliationIntervalMs: number;
   logger: Logger;
 }
 
@@ -73,21 +74,23 @@ export function createJobHandlers(dependencies: WorkerDependencies): Map<string,
     dependencies.logger,
   );
 
+  const provisionHandler: JobHandler = (job: LeasedJob) => {
+    const payload = job.payload as { matchId: string };
+    return provisioning.runProvisionJob(payload.matchId);
+  };
+  provisionHandler.onPermanentFailure = (job, error) =>
+    failProvisioning(dependencies.prisma, (job.payload as { matchId: string }).matchId, error);
+
+  const bootHandler: JobHandler = (job: LeasedJob) => {
+    const payload = job.payload as { matchId: string; serverId: string; startedAt: number };
+    return provisioning.runBootPollJob(payload.matchId, payload.serverId, payload.startedAt);
+  };
+  bootHandler.onPermanentFailure = (job, error) =>
+    failProvisioning(dependencies.prisma, (job.payload as { matchId: string }).matchId, error);
+
   return new Map<string, JobHandler>([
-    [
-      'PROVISION_SERVER',
-      (job: LeasedJob) => {
-        const payload = job.payload as { matchId: string };
-        return provisioning.runProvisionJob(payload.matchId);
-      },
-    ],
-    [
-      'POLL_SERVER_BOOT',
-      (job: LeasedJob) => {
-        const payload = job.payload as { matchId: string; serverId: string; startedAt: number };
-        return provisioning.runBootPollJob(payload.matchId, payload.serverId, payload.startedAt);
-      },
-    ],
+    ['PROVISION_SERVER', provisionHandler],
+    ['POLL_SERVER_BOOT', bootHandler],
     [
       'CLEANUP_MATCH',
       (job: LeasedJob) => {
@@ -113,37 +116,77 @@ export function createJobHandlers(dependencies: WorkerDependencies): Map<string,
       'ORPHAN_SCAN',
       async () => {
         await orphanScanner.scan();
-        const nextRun = new Date(Date.now() + 60 * 60 * 1000);
-        await dependencies.prisma.job.upsert({
-          where: { idempotencyKey: 'orphan-scan' },
-          update: { runAt: nextRun },
-          create: {
-            type: 'ORPHAN_SCAN',
-            idempotencyKey: 'orphan-scan',
-            payload: {},
-            runAt: nextRun,
-          },
-        });
+        return { rescheduleAt: new Date(Date.now() + 60 * 60 * 1000) };
       },
     ],
     [
       'MATCHZY_RECONCILE',
       async () => {
         await matchzyReconciliation.runPeriodicReconciliation();
-        const nextRun = new Date(Date.now() + 60 * 1000);
-        await dependencies.prisma.job.upsert({
-          where: { idempotencyKey: 'matchzy-reconcile' },
-          update: { runAt: nextRun },
-          create: {
-            type: 'MATCHZY_RECONCILE',
-            idempotencyKey: 'matchzy-reconcile',
-            payload: {},
-            runAt: nextRun,
-          },
-        });
+        return {
+          rescheduleAt: new Date(Date.now() + dependencies.matchzyReconciliationIntervalMs),
+        };
       },
     ],
   ]);
+}
+
+async function failProvisioning(
+  prisma: PrismaClient,
+  matchId: string,
+  error: string,
+): Promise<void> {
+  await prisma.$transaction(async (transaction) => {
+    const match = await transaction.match.findUnique({ where: { id: matchId } });
+    if (match === null || ['FINISHED', 'CANCELED', 'FAILED'].includes(match.state)) return;
+    const attempt = await transaction.provisioningAttempt.findFirst({
+      where: { matchId },
+      select: { id: true },
+    });
+    const requiresCleanup = match.dathostServerId !== null || attempt !== null;
+    await transaction.match.update({
+      where: { id: matchId },
+      data: {
+        state: 'FAILED',
+        cleanupStatus: requiresCleanup ? 'PENDING' : 'NOT_REQUIRED',
+        guildSlotActive: requiresCleanup,
+        failureReason: error.slice(0, 1000),
+        finishedAt: new Date(),
+        version: { increment: 1 },
+      },
+    });
+    await transaction.matchStateTransition.create({
+      data: {
+        matchId,
+        fromState: match.state,
+        toState: 'FAILED',
+        source: 'WORKER_FAILURE',
+        reason: error.slice(0, 1000),
+      },
+    });
+    if (requiresCleanup) {
+      await transaction.job.upsert({
+        where: { idempotencyKey: `cleanup:${matchId}` },
+        update: { status: 'PENDING', runAt: new Date(), attempts: 0, lastError: null },
+        create: {
+          matchId,
+          type: 'CLEANUP_MATCH',
+          idempotencyKey: `cleanup:${matchId}`,
+          payload: { matchId },
+        },
+      });
+    }
+    await transaction.job.upsert({
+      where: { idempotencyKey: `panel:${matchId}:failure` },
+      update: { status: 'PENDING', runAt: new Date(), attempts: 0, lastError: null },
+      create: {
+        matchId,
+        type: 'PANEL_REFRESH',
+        idempotencyKey: `panel:${matchId}:failure`,
+        payload: { matchId },
+      },
+    });
+  });
 }
 
 async function cleanupJob(

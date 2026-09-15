@@ -1,0 +1,18 @@
+import { z } from 'zod';
+import { registerCommands } from './bot/client.js';
+
+const environment = z
+  .object({
+    DISCORD_TOKEN: z.string().min(1),
+    DISCORD_CLIENT_ID: z.string().regex(/^\d{17,20}$/),
+  })
+  .parse(process.env);
+
+registerCommands(environment.DISCORD_TOKEN, environment.DISCORD_CLIENT_ID)
+  .then(() => process.stdout.write('Discord slash commands registered.\n'))
+  .catch((error: unknown) => {
+    process.stderr.write(
+      `Command registration failed: ${error instanceof Error ? error.message : 'unknown error'}\n`,
+    );
+    process.exitCode = 1;
+  });

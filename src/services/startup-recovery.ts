@@ -68,10 +68,18 @@ export class StartupRecovery {
     idempotencyKey: string,
     runAt?: Date,
   ): Promise<void> {
+    const scheduledAt = runAt ?? new Date();
     await this.prisma.job.upsert({
       where: { idempotencyKey },
-      update: runAt === undefined ? {} : { runAt },
-      create: { type, payload, idempotencyKey, runAt: runAt ?? new Date() },
+      update: {
+        status: 'PENDING',
+        attempts: 0,
+        runAt: scheduledAt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: null,
+      },
+      create: { type, payload, idempotencyKey, runAt: scheduledAt },
     });
   }
 }

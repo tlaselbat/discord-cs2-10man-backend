@@ -2,6 +2,7 @@ import type { APIEmbed, Client, TextBasedChannel, TextChannel } from 'discord.js
 import type { PrismaClient } from '../generated/prisma/client.js';
 import { buildMatchControls } from '../bot/components.js';
 import { renderMatchPanel, type RenderedPanel } from '../bot/panel.js';
+import { parseMatchScore } from '../domain/score.js';
 
 interface MatchForPanel {
   id: string;
@@ -15,6 +16,7 @@ interface MatchForPanel {
   discordPanelMessageId: string | null;
   players: { team: string; readyState: string; displayNameSnapshot: string }[];
   profile: { mapAllowlist: string[] };
+  score: unknown;
 }
 
 export class PanelService {
@@ -89,7 +91,11 @@ export class PanelService {
   }
 
   private async render(match: MatchForPanel) {
-    const profiles = await this.prisma.gameProfile.findMany({ select: { key: true } });
+    const profiles = await this.prisma.gameProfile.findMany({
+      where: { enabled: true },
+      orderBy: { key: 'asc' },
+      select: { key: true },
+    });
     const allowedProfiles = profiles.map((profile) => ({ key: profile.key, label: profile.key }));
     const panel = renderMatchPanel({
       matchId: match.id,
@@ -106,7 +112,7 @@ export class PanelService {
       team2: match.players
         .filter((player) => player.team === 'TEAM_2')
         .map((player) => player.displayNameSnapshot),
-      score: null,
+      score: parseMatchScore(match.score),
     });
     const controls = buildMatchControls({
       matchId: match.id,

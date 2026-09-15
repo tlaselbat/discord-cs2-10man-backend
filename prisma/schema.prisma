@@ -74,6 +74,27 @@ enum CredentialCapability {
   EVENT_WRITE
 }
 
+enum ManagedResourceState {
+  NONE
+  SETTING_UP
+  ACTIVE
+  TEARING_DOWN
+}
+
+enum ManagedSetupStep {
+  RESERVED
+  CATEGORY_CREATE_IN_FLIGHT
+  CATEGORY_CREATED
+  LOBBY_TEXT_CREATE_IN_FLIGHT
+  LOBBY_TEXT_CREATED
+  LOBBY_VOICE_CREATE_IN_FLIGHT
+  LOBBY_VOICE_CREATED
+  TEAM1_VOICE_CREATE_IN_FLIGHT
+  TEAM1_VOICE_CREATED
+  TEAM2_VOICE_CREATE_IN_FLIGHT
+  TEAM2_VOICE_CREATED
+}
+
 model User {
   discordUserId   String          @id @map("discord_user_id")
   displayName     String          @map("display_name")
@@ -125,9 +146,15 @@ model GuildSettings {
   administratorRoleIds    String[] @map("administrator_role_ids")
   dathostTemplateServerId String?  @map("dathost_template_server_id")
   defaultServerLocation   String?  @map("default_server_location")
-  defaultGameProfileKey   String?  @map("default_game_profile_key")
-  enabled                  Boolean  @default(false)
-  version                  Int      @default(0)
+  defaultGameProfileKey      String?              @map("default_game_profile_key")
+  enabled                    Boolean              @default(false)
+  managedResourceState       ManagedResourceState @default(NONE) @map("managed_resource_state")
+  managedSetupStep           ManagedSetupStep?    @map("managed_setup_step")
+  managedAttemptId           String?               @map("managed_attempt_id") @db.Uuid
+  managedCategoryId          String?               @map("managed_category_id")
+  managedChannelIds          String[]              @default([]) @map("managed_channel_ids")
+  managedResourcesCreatedAt  DateTime?             @map("managed_resources_created_at")
+  version                     Int                  @default(0)
   createdAt                DateTime @default(now()) @map("created_at")
   updatedAt                DateTime @updatedAt @map("updated_at")
   matches                  Match[]

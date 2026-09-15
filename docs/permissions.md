@@ -1,47 +1,77 @@
 # Permissions Matrix
 
-## Discord roles
+## Authorization sources
 
-| Role              | Purpose                                                                            |
-| ----------------- | ---------------------------------------------------------------------------------- |
-| Privileged member | Can create a 10man (`/10man create`)                                               |
-| Moderator         | Can override match controls, transfer leader, remove participants, run diagnostics |
-| Administrator     | Can configure the guild and has full override                                      |
+The bot uses configured Discord role IDs for normal authorization. Discord's native Administrator permission is additionally accepted for initial and later guild configuration, allowing first-time setup before a bot administrator role exists.
+
+| Identity                     | Purpose                                                                                                         |
+| ---------------------------- | --------------------------------------------------------------------------------------------------------------- |
+| Participant                  | Joined the active match with a verified Steam identity                                                          |
+| Leader                       | Participant identified by `leaderDiscordUserId`                                                                 |
+| Privileged member            | Configured role allowed to create matches and view active details                                               |
+| Moderator                    | Configured role with leader controls, participant management, transfer, and diagnostics                         |
+| Administrator                | Configured role with all bot actions                                                                            |
+| Native Discord administrator | Can bootstrap/reconfigure the guild; other actions still derive from the bot actor context and configured roles |
 
 ## Match actions
 
-| Action                                       | Participant | Leader | Moderator | Admin   |
-| -------------------------------------------- | ----------- | ------ | --------- | ------- |
-| View status / connect info                   | yes         | yes    | yes       | yes     |
-| Join                                         | yes\*       | yes    | yes       | yes     |
-| Leave / ready                                | yes         | yes    | yes       | yes     |
-| Create match                                 | no          | no     | no        | yes\*\* |
-| Organize teams / select map                  | no          | yes    | yes       | yes     |
-| Lock teams                                   | no          | yes    | yes       | yes     |
-| Force start / pause / resume / restore / end | no          | yes    | yes       | yes     |
-| Cancel match                                 | no          | yes    | yes       | yes     |
-| Transfer leader / remove participant         | no          | no     | yes       | yes     |
-| Configure guild                              | no          | no     | no        | yes     |
-| Run diagnostics                              | no          | no     | yes       | yes     |
+| Action                                       | Participant | Leader | Privileged | Moderator                           | Administrator              |
+| -------------------------------------------- | ----------- | ------ | ---------- | ----------------------------------- | -------------------------- |
+| View `/10man status`                         | yes         | yes    | yes        | yes                                 | yes                        |
+| Get private connect information              | yes         | yes    | yes        | only if also participant/privileged | yes                        |
+| Join when not already participating          | yes         | yes    | yes        | yes                                 | yes                        |
+| Leave / ready                                | yes         | yes    | no         | only if participating               | yes                        |
+| Create match                                 | no          | no     | yes        | yes                                 | yes                        |
+| Organize teams / select map or profile       | no          | yes    | no         | yes                                 | yes                        |
+| Lock teams                                   | no          | yes    | no         | yes                                 | yes                        |
+| Force start / pause / resume / restore / end | no          | yes    | no         | yes                                 | yes                        |
+| Cancel match                                 | no          | yes    | no         | yes                                 | yes                        |
+| Transfer leader / remove participant         | no          | no     | no         | yes                                 | yes                        |
+| Configure guild                              | no          | no     | no         | no                                  | configured or native admin |
+| Setup/recover/disable/enable/teardown        | no          | no     | no         | no                                  | configured or native admin |
+| Run diagnostics                              | no          | no     | no         | yes                                 | yes                        |
 
-\* A participant can leave; an unlinked user cannot join until Steam-verified.  
-\*\* Requires the configured privileged role, not the Discord admin permission.
+Joining also requires an active verified Steam identity and available profile capacity. Team controls remain server-authorized even though Discord user selectors can display users outside the match.
 
-## Bot permissions required in Discord
+## Bot channel permissions
 
-- View Channels
+Configuration verifies:
+
+### Lobby text channel
+
+- View Channel
 - Send Messages
 - Embed Links
 - Read Message History
+
+### Lobby and team voice channels
+
+- View Channel
 - Connect
-- Speak
 - Move Members
-- Manage Messages (for panel cleanup)
 
-## DatHost permissions required
+Managed setup, setup recovery, and teardown additionally require guild-level **Manage Channels**. Manual configuration and normal match operation do not use that permission.
 
-- API access with email/password
-- Permission to duplicate the configured template
-- Permission to stop/delete duplicated servers owned by the bot
+The bot does not currently require Speak for its implemented voice behavior. If server-level or category overrides deny one of these permissions, configuration or diagnostics reports the affected channel.
 
-The bot never deletes or reconfigures the protected template.
+## Discord application scopes
+
+The invite must include:
+
+- `bot`
+- `applications.commands`
+
+Command registration additionally requires a valid application ID and bot token for the same application.
+
+## DatHost access
+
+The configured account must be able to:
+
+- List and inspect servers for recovery and diagnostics.
+- Create a provisional CS2 destination.
+- Duplicate the configured template into that destination.
+- Configure and start the disposable destination.
+- Send allowlisted MatchZy console commands.
+- Stop and delete positively identified bot-owned disposable servers.
+
+The application refuses to configure or delete protected template IDs and verifies disposable ownership before cleanup.

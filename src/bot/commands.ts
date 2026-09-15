@@ -53,6 +53,43 @@ export const commands = [
         )
         .addSubcommand((command) =>
           command
+            .setName('setup')
+            .setDescription('Create and configure managed 10man channels')
+            .addRoleOption((option) =>
+              option.setName('privileged_role').setDescription('Role that can create 10mans'),
+            )
+            .addRoleOption((option) =>
+              option.setName('moderator_role').setDescription('Role for match overrides'),
+            )
+            .addRoleOption((option) =>
+              option.setName('administrator_role').setDescription('Role for bot administration'),
+            )
+            .addStringOption((option) =>
+              option
+                .setName('dathost_template_server_id')
+                .setDescription('DatHost template server ID'),
+            )
+            .addStringOption((option) =>
+              option.setName('dathost_location').setDescription('DatHost server location'),
+            )
+            .addStringOption((option) =>
+              option.setName('default_game_profile').setDescription('Default game profile key'),
+            ),
+        )
+        .addSubcommand((command) =>
+          command.setName('recover-setup').setDescription('Recover interrupted managed setup'),
+        )
+        .addSubcommand((command) =>
+          command.setName('disable').setDescription('Disable new 10man creation'),
+        )
+        .addSubcommand((command) =>
+          command.setName('enable').setDescription('Validate and enable this server'),
+        )
+        .addSubcommand((command) =>
+          command.setName('teardown').setDescription('Delete bot-managed 10man channels'),
+        )
+        .addSubcommand((command) =>
+          command
             .setName('configure')
             .setDescription('Configure this server for 10mans')
             .addChannelOption((option) =>

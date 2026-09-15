@@ -12,8 +12,9 @@ export interface WorkerRunnerOptions {
 
 export class WorkerRunner {
   private readonly worker: DurableWorker;
-  private interval: ReturnType<typeof setInterval> | null = null;
+  private timer: ReturnType<typeof setTimeout> | null = null;
   private running = false;
+  private inFlight: Promise<void> | null = null;
 
   public constructor(
     store: JobStore,
@@ -33,25 +34,35 @@ export class WorkerRunner {
   public start(): void {
     if (this.running) return;
     this.running = true;
-    this.interval = setInterval(() => {
-      this.worker
-        .runOnce()
-        .then((hadWork) => {
-          if (hadWork) {
-            this.logger.debug({ workerId: this.options.workerId }, 'Worker completed a job');
-          }
-        })
-        .catch((error: unknown) => {
-          this.logger.error({ err: error, workerId: this.options.workerId }, 'Worker loop error');
-        });
+    this.schedule();
+  }
+
+  public async stop(): Promise<void> {
+    this.running = false;
+    if (this.timer !== null) {
+      clearTimeout(this.timer);
+      this.timer = null;
+    }
+    await this.inFlight;
+  }
+
+  private schedule(): void {
+    if (!this.running) return;
+    this.timer = setTimeout(() => {
+      this.timer = null;
+      this.inFlight = this.run().finally(() => {
+        this.inFlight = null;
+        this.schedule();
+      });
     }, this.options.pollIntervalMs);
   }
 
-  public stop(): void {
-    if (this.interval !== null) {
-      clearInterval(this.interval);
-      this.interval = null;
+  private async run(): Promise<void> {
+    try {
+      const hadWork = await this.worker.runOnce();
+      if (hadWork) this.logger.debug({ workerId: this.options.workerId }, 'Worker completed a job');
+    } catch (error: unknown) {
+      this.logger.error({ err: error, workerId: this.options.workerId }, 'Worker loop error');
     }
-    this.running = false;
   }
 }

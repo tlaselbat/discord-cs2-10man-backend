@@ -122,6 +122,10 @@ export class ProvisioningService {
     });
     if (match === null) throw new Error('Match not found');
     if (match.dathostServerId !== serverId) throw new Error('Boot poll server ID mismatch');
+    if (match.state === 'MATCH_LOADED') return;
+    if (!['SERVER_BOOTING', 'SERVER_READY'].includes(match.state)) {
+      throw new Error(`Boot poll cannot run from ${match.state}`);
+    }
 
     const server = await this.dathost.getServer(serverId);
     if (server === null) throw new Error('DatHost server disappeared during boot');
@@ -136,6 +140,20 @@ export class ProvisioningService {
     const ports = server.ports;
     if (ip === undefined || ports === undefined) {
       throw new Error('DatHost server is not reporting connection details');
+    }
+
+    if (match.state === 'SERVER_BOOTING') {
+      await this.prisma.$transaction(async (transaction) => {
+        await transaction.match.update({ where: { id: matchId }, data: { state: 'SERVER_READY' } });
+        await transaction.matchStateTransition.create({
+          data: {
+            matchId,
+            fromState: 'SERVER_BOOTING',
+            toState: 'SERVER_READY',
+            source: 'WORKER_BOOT_POLL',
+          },
+        });
+      });
     }
 
     const team1 = match.players.filter((player) => player.team === 'TEAM_1');

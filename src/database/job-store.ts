@@ -43,6 +43,20 @@ export class PrismaJobStore implements JobStore {
     });
   }
 
+  public async reschedule(jobId: string, runAt: Date): Promise<void> {
+    await this.prisma.job.update({
+      where: { id: jobId },
+      data: {
+        status: 'PENDING',
+        attempts: 0,
+        runAt,
+        leaseOwner: null,
+        leaseExpiresAt: null,
+        lastError: null,
+      },
+    });
+  }
+
   public async retry(jobId: string, runAt: Date, error: string): Promise<void> {
     await this.prisma.job.update({
       where: { id: jobId },

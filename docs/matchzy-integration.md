@@ -2,47 +2,65 @@
 
 ## Pinned contract
 
-- **Version:** 0.8.15
+- **MatchZy:** 0.8.15
 - **Commit:** `ef289d512766b89b0f7bf3088208ae88235e61fa`
-- **CounterStrikeSharp:** `1.0.342`
-- **Contract file:** `contracts/matchzy/0.8.15/manifest.json`
+- **CounterStrikeSharp:** 1.0.342
+- **Contract manifest:** `contracts/matchzy/0.8.15/manifest.json`
 
-Do not change the MatchZy version without updating the manifest, re-testing the full lifecycle, and recording new artifact hashes.
+Do not upgrade MatchZy without updating the manifest, validating schemas and commands, recording artifact hashes, and repeating the full staging lifecycle.
 
-## Config loading
+## Server-ready and config loading
 
-The bot builds a schema-valid MatchZy config JSON containing:
+When DatHost stops reporting `booting` and provides IP/port data, the worker records `SERVER_BOOTING → SERVER_READY`. It then issues scoped credentials, builds MatchZy configuration, sends the load command, and records `SERVER_READY → MATCH_LOADED`.
 
-- Exact team rosters and SteamID64 values
-- Map and side assignments
-- Remote log/event URLs
-- Authenticated MatchZy event endpoint bound to the match
+A restart in `SERVER_READY` resumes MatchZy loading. An already `MATCH_LOADED` boot-poll job is an idempotent no-op.
 
-It then sends to the DatHost console:
+The generated config contains:
+
+- MatchZy numeric match ID
+- Selected map and team names
+- Exact SteamID64 roster/team assignments
+- Players-per-team readiness requirement
+- Allowlisted profile CVARs
+- Remote event URL and event token header
+
+The worker sends:
 
 ```text
-matchzy_loadmatch_url "<config_url>" "<auth_header_name>" "<auth_header_value>"
+matchzy_loadmatch_url "<config_url>" "x-matchzy-token" "<config_token>"
 ```
 
-The config URL is ephemeral and scoped to the match and server generation.
+The authenticated config endpoint is:
+
+```text
+GET /internal/matches/:matchId/matchzy-config
+x-matchzy-token: <CONFIG_READ token>
+```
+
+Config responses use `Cache-Control: no-store`. Credentials are random, hashed at rest, scoped to `CONFIG_READ`, bound to match/server/version, expiring, and revoked or rotated as lifecycle work proceeds.
 
 ## Events
 
-The bot listens for MatchZy events at `/webhooks/matchzy`.
+MatchZy posts to:
 
-Handled events include:
+```text
+POST /webhooks/matchzy/:matchId
+x-matchzy-token: <EVENT_WRITE token>
+```
+
+The route authenticates the server-bound token before parsing and ingesting the event. Handled contract events include:
 
 - `series_start`
 - `going_live`
 - `round_end`
-- `map_end` / `map_result`
+- `map_result`
 - `series_end`
 
-Each event is journaled, deduplicated by an event-specific key, and translated into the backend state machine.
+Events are journaled with a payload hash, deduplicated by event-specific keys, and processed transactionally. Round and map events update persisted team scores. State/score changes enqueue idempotent persistent-panel refresh jobs. `series_end` stores the result, moves the match to `FINISHED`, marks cleanup pending, and queues cleanup.
 
-## Commands
+## Discord controls
 
-Only these commands are ever sent to the server:
+Only semantic allowlisted commands are rendered:
 
 ```text
 css_start
@@ -52,8 +70,18 @@ css_restore <round>
 css_forceend
 ```
 
-All commands are rendered by `src/integrations/matchzy/commands.ts` and passed through DatHost console. No raw RCON is exposed to Discord users.
+Discord users cannot submit raw console or RCON text. The DatHost client rejects newline-containing console commands, and authorization is checked before controls are sent.
+
+Restore controls currently expose rounds 1-25, matching Discord's maximum select-menu options.
 
 ## Reconciliation
 
-If the bot misses a `series_end` event, the periodic `MATCHZY_RECONCILE` job detects that the DatHost server is gone and transitions the match to `FINISHED`, triggering cleanup.
+`MATCHZY_RECONCILE` is a recurring durable singleton scheduled by `MATCHZY_RECONCILIATION_INTERVAL_MS`.
+
+- If a match is active but its DatHost server is missing/offline without `series_end`, reconciliation moves it to `FINISHED`, records the observation/correction, and queues cleanup and panel refresh.
+- If events are older than `MATCHZY_STALE_AFTER_MS` while the server remains on, reconciliation records and logs staleness without forcing a result.
+- After successful execution, the job returns to `PENDING` with a future `run_at`; startup recovery reactivates it after restarts.
+
+## Failure handling
+
+Repeated boot or load failures eventually invoke permanent provisioning recovery. The match moves to `FAILED`, the actual prior state is recorded, and cleanup is queued whenever a server or provisioning attempt may exist. The guild slot is retained until cleanup safely completes.

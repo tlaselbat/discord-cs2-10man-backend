@@ -17,6 +17,11 @@ function createMockPrisma(overrides: object = {}): PrismaClient {
         moderatorRoleIds: ['role-2'],
         administratorRoleIds: ['role-3'],
         dathostTemplateServerId: 'template-1',
+        managedResourceState: 'NONE',
+        managedSetupStep: null,
+        managedCategoryId: null,
+        managedChannelIds: [],
+        managedResourcesCreatedAt: null,
         ...overrides,
       }),
     },
@@ -46,6 +51,7 @@ function createMockClient(permissionsOk = true) {
         },
         members: {
           me: {
+            permissions: { has: () => permissionsOk },
             permissionsIn: () => ({
               has: () => permissionsOk,
             }),
@@ -112,7 +118,10 @@ describe('DiagnosticsService', () => {
           channels: { fetch: async () => null },
           roles: { fetch: async () => ({ id: 'role-1' }) },
           members: {
-            me: { permissionsIn: () => ({ has: () => true }) },
+            me: {
+              permissions: { has: () => true },
+              permissionsIn: () => ({ has: () => true }),
+            },
             fetch: async () => ({ permissionsIn: () => ({ has: () => true }) }),
           },
         }),

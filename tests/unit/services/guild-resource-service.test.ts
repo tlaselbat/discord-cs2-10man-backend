@@ -1,0 +1,73 @@
+import { describe, expect, it, vi } from 'vitest';
+import { GuildResourceService } from '../../../src/services/guild-resource-service.js';
+import type { PrismaClient } from '../../../src/generated/prisma/client.js';
+
+function createService(settings: object | null, activeMatch: object | null = null) {
+  const transaction = {
+    $executeRaw: vi.fn().mockResolvedValue(0),
+    guildSettings: {
+      findUnique: vi.fn().mockResolvedValue(settings),
+      update: vi.fn().mockResolvedValue(undefined),
+      updateMany: vi.fn().mockResolvedValue({ count: 1 }),
+    },
+    match: { findFirst: vi.fn().mockResolvedValue(activeMatch) },
+    auditEvent: { create: vi.fn().mockResolvedValue(undefined) },
+  };
+  const prisma = {
+    guildSettings: { findUnique: vi.fn().mockResolvedValue(settings) },
+    match: { findFirst: vi.fn().mockResolvedValue(activeMatch) },
+    $transaction: vi.fn(async (callback: (client: typeof transaction) => Promise<unknown>) =>
+      callback(transaction),
+    ),
+  } as unknown as PrismaClient;
+  const service = new GuildResourceService(
+    prisma,
+    {} as ConstructorParameters<typeof GuildResourceService>[1],
+    { error: vi.fn() } as unknown as ConstructorParameters<typeof GuildResourceService>[2],
+  );
+  return { service, transaction };
+}
+
+const managedSettings = {
+  guildId: '123456789012345678',
+  enabled: true,
+  version: 3,
+  managedResourceState: 'ACTIVE',
+  managedSetupStep: null,
+  managedAttemptId: '123e4567-e89b-12d3-a456-426614174000',
+  managedCategoryId: '323456789012345678',
+  managedChannelIds: ['423456789012345678'],
+  managedResourcesCreatedAt: new Date(),
+};
+
+describe('GuildResourceService lifecycle guards', () => {
+  it('soft-disables without clearing managed resources', async () => {
+    const { service, transaction } = createService(managedSettings);
+    await expect(
+      service.disable('123456789012345678', '223456789012345678', 'correlation'),
+    ).resolves.toBe(true);
+    expect(transaction.guildSettings.update).toHaveBeenCalledWith({
+      where: { guildId: '123456789012345678' },
+      data: { enabled: false, version: { increment: 1 } },
+    });
+  });
+
+  it('refuses teardown preview while a guild slot is active', async () => {
+    const { service } = createService(managedSettings, { id: 'match' });
+    await expect(service.teardownPreview('123456789012345678')).rejects.toThrow(
+      'Finish the active match',
+    );
+  });
+
+  it('refuses to delete manual resources', async () => {
+    const { service } = createService({
+      ...managedSettings,
+      managedResourceState: 'NONE',
+      managedCategoryId: null,
+      managedChannelIds: [],
+    });
+    await expect(service.teardownPreview('123456789012345678')).rejects.toThrow(
+      'Manually configured channels are never removed',
+    );
+  });
+});

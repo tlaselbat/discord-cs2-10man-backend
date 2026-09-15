@@ -19,6 +19,11 @@ export const matchActions = [
   'TRANSFER_LEADER',
   'REMOVE_PARTICIPANT',
   'CONFIGURE_GUILD',
+  'SETUP_GUILD',
+  'RECOVER_GUILD_SETUP',
+  'DISABLE_GUILD',
+  'ENABLE_GUILD',
+  'TEARDOWN_GUILD',
   'DIAGNOSTICS',
 ] as const;
 
@@ -63,7 +68,17 @@ export function isAuthorized(
   match?: MatchAuthorizationContext,
 ): boolean {
   if (actor.isAdministrator) return true;
-  if (action === 'CONFIGURE_GUILD') return false;
+  if (
+    [
+      'CONFIGURE_GUILD',
+      'SETUP_GUILD',
+      'RECOVER_GUILD_SETUP',
+      'DISABLE_GUILD',
+      'ENABLE_GUILD',
+      'TEARDOWN_GUILD',
+    ].includes(action)
+  )
+    return false;
   if (actor.isModerator && moderatorActions.has(action)) return true;
   if (action === 'CREATE') return actor.isPrivilegedMember;
   if (action === 'VIEW') return actor.isParticipant || actor.isPrivilegedMember;

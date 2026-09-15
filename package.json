@@ -11,6 +11,7 @@
     "dev": "tsx watch src/main.ts",
     "build": "tsc -p tsconfig.build.json",
     "start": "node --enable-source-maps dist/main.js",
+    "discord:register": "tsx src/register-commands.ts",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "lint": "eslint .",

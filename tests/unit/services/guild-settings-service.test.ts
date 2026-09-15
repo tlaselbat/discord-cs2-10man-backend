@@ -6,9 +6,12 @@ import type { PrismaClient } from '../../../src/generated/prisma/client.js';
 function createMockPrisma(profileExists = true): PrismaClient {
   return {
     gameProfile: {
-      findUnique: vi.fn().mockResolvedValue(profileExists ? { key: 'competitive_5v5' } : null),
+      findUnique: vi
+        .fn()
+        .mockResolvedValue(profileExists ? { key: 'competitive_5v5', enabled: true } : null),
     },
     guildSettings: {
+      findUnique: vi.fn().mockResolvedValue(null),
       upsert: vi.fn().mockResolvedValue(undefined),
     },
     auditEvent: {

@@ -1,6 +1,7 @@
 import { assertAuthorized, type ActorContext } from '../domain/authorization.js';
 import { RandomTeamBalancer } from '../domain/teams.js';
 import type { PrismaClient } from '../generated/prisma/client.js';
+import { PublicError } from '../errors/public-error.js';
 
 export interface CreateMatchCommand {
   guildId: string;
@@ -21,6 +22,14 @@ export class MatchService {
 
   public async create(command: CreateMatchCommand): Promise<string> {
     return this.prisma.$transaction(async (transaction) => {
+      await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${command.guildId}, 0))`;
+      const active = await transaction.match.findFirst({
+        where: { guildId: command.guildId, guildSlotActive: true },
+        select: { id: true },
+      });
+      if (active !== null) {
+        throw new PublicError('ACTIVE_MATCH_EXISTS', 'This server already has an active 10man.');
+      }
       const settings = await transaction.guildSettings.findUnique({
         where: { guildId: command.guildId },
       });
@@ -60,6 +69,41 @@ export class MatchService {
         },
       });
       return match.id;
+    });
+  }
+
+  public async failUnpublishedMatch(matchId: string, correlationId: string): Promise<void> {
+    await this.prisma.$transaction(async (transaction) => {
+      const match = await transaction.match.findUnique({ where: { id: matchId } });
+      if (match === null || match.dathostServerId !== null) return;
+      await transaction.match.update({
+        where: { id: matchId },
+        data: {
+          state: 'FAILED',
+          guildSlotActive: false,
+          failureReason: 'Initial Discord panel could not be published',
+          finishedAt: new Date(),
+          version: { increment: 1 },
+        },
+      });
+      await transaction.matchStateTransition.create({
+        data: {
+          matchId,
+          fromState: match.state,
+          toState: 'FAILED',
+          source: 'PANEL_PUBLISH_FAILED',
+        },
+      });
+      await transaction.auditEvent.create({
+        data: {
+          matchId,
+          guildId: match.guildId,
+          eventType: 'panel_publish_failed',
+          result: 'failed',
+          correlationId,
+          metadata: {},
+        },
+      });
     });
   }
 
@@ -503,19 +547,50 @@ export class MatchService {
     correlationId: string,
   ): Promise<void> {
     await this.prisma.$transaction(async (transaction) => {
-      const match = await transaction.match.findUnique({ where: { id: matchId } });
+      await transaction.$executeRaw`SELECT pg_advisory_xact_lock(hashtextextended(${matchId}, 0))`;
+      const match = await transaction.match.findUnique({
+        where: { id: matchId },
+        include: { players: true },
+      });
       if (match === null || !['OPEN', 'FULL', 'TEAM_SETUP'].includes(match.state)) {
         throw new Error('Profile cannot be changed in the current state');
       }
       assertAuthorized('SELECT_PROFILE', actor, match);
       if (match.version !== expectedVersion) throw new Error('Match panel is stale');
       const profile = await transaction.gameProfile.findUnique({ where: { key: profileKey } });
-      if (profile === null) throw new Error('Game profile does not exist');
+      if (profile === null || !profile.enabled) {
+        throw new PublicError('PROFILE_UNAVAILABLE', 'That game profile is not available.');
+      }
+      const capacity = profile.playersPerTeam * 2;
+      if (match.players.length > capacity) {
+        throw new PublicError(
+          'PROFILE_CAPACITY',
+          `That profile supports ${String(capacity)} players, but ${String(match.players.length)} are already in the lobby.`,
+        );
+      }
+      const state = match.players.length === capacity ? 'FULL' : 'OPEN';
+      const selectedMap = profile.mapAllowlist.includes(match.selectedMap ?? '')
+        ? match.selectedMap
+        : null;
+      await transaction.matchPlayer.updateMany({
+        where: { matchId },
+        data: { team: 'UNASSIGNED' },
+      });
       const updated = await transaction.match.updateMany({
         where: { id: matchId, version: expectedVersion },
-        data: { selectedGameProfileKey: profileKey, version: { increment: 1 } },
+        data: {
+          selectedGameProfileKey: profileKey,
+          selectedMap,
+          state,
+          version: { increment: 1 },
+        },
       });
       if (updated.count !== 1) throw new Error('Match changed concurrently');
+      if (match.state !== state) {
+        await transaction.matchStateTransition.create({
+          data: { matchId, fromState: match.state, toState: state, source: 'PROFILE_SELECTED' },
+        });
+      }
       await transaction.auditEvent.create({
         data: {
           matchId,

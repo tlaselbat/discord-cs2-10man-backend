@@ -10,6 +10,14 @@ export interface DiagnosticsReport {
   permissions: { label: string; ok: boolean; missing?: string[] }[];
   template?: { id: string; ok: boolean; error?: string };
   activeMatch?: { id: string; state: string; cleanupStatus: string } | null;
+  managed?: {
+    state: string;
+    setupStep: string | null;
+    categoryId: string | null;
+    channelIds: string[];
+    manageChannels: boolean;
+    createdAt: Date | null;
+  };
 }
 
 export class DiagnosticsService {
@@ -147,6 +155,14 @@ export class DiagnosticsService {
       permissions: permissionChecks,
       ...(template === undefined ? {} : { template }),
       activeMatch: activeMatch === null ? null : activeMatch,
+      managed: {
+        state: settings.managedResourceState,
+        setupStep: settings.managedSetupStep,
+        categoryId: settings.managedCategoryId,
+        channelIds: settings.managedChannelIds,
+        manageChannels: botMember.permissions.has(PermissionFlagsBits.ManageChannels),
+        createdAt: settings.managedResourcesCreatedAt,
+      },
     };
   }
 

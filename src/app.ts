@@ -69,6 +69,7 @@ export async function createApplication(
     dathost,
     cipher,
     componentSigningSecret: environment.MATCH_TOKEN_SIGNING_SECRET,
+    logger,
   });
   const worker = new WorkerRunner(
     new PrismaJobStore(prisma),
@@ -82,6 +83,7 @@ export async function createApplication(
       templateServerIds: new Set([environment.DATHOST_TEMPLATE_SERVER_ID]),
       componentSigningSecret: environment.MATCH_TOKEN_SIGNING_SECRET,
       matchzyStaleAfterMs: environment.MATCHZY_STALE_AFTER_MS,
+      matchzyReconciliationIntervalMs: environment.MATCHZY_RECONCILIATION_INTERVAL_MS,
       logger,
     }),
     {
@@ -107,7 +109,7 @@ export async function createApplication(
       worker.start();
     },
     async stop() {
-      worker.stop();
+      await worker.stop();
       await discord.destroy();
       await http.close();
       await prisma.$disconnect();
