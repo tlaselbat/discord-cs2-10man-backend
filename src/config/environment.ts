@@ -1,0 +1,39 @@
+import { z } from 'zod';
+
+const environmentSchema = z.object({
+  NODE_ENV: z.enum(['development', 'test', 'production']).default('development'),
+  HOST: z.string().min(1).default('0.0.0.0'),
+  PORT: z.coerce.number().int().min(1).max(65_535).default(3000),
+  LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
+  DATABASE_URL: z.url().refine((value) => value.startsWith('postgresql://'), 'Must be PostgreSQL'),
+  DISCORD_TOKEN: z.string().min(1),
+  DISCORD_CLIENT_ID: z.string().regex(/^\d{17,20}$/),
+  DATHOST_EMAIL: z.email(),
+  DATHOST_PASSWORD: z.string().min(1),
+  DATHOST_TEMPLATE_SERVER_ID: z.string().min(1),
+  PUBLIC_BASE_URL: z.url().refine((value) => value.startsWith('https://'), 'HTTPS is required'),
+  MATCH_TOKEN_SIGNING_SECRET: z.string().min(32),
+  CREDENTIAL_ENCRYPTION_KEY: z
+    .string()
+    .refine((value) => Buffer.from(value, 'base64').length === 32, 'Must encode exactly 32 bytes'),
+  DEFAULT_DATHOST_LOCATION: z.string().optional(),
+  WORKER_POLL_INTERVAL_MS: z.coerce.number().int().min(100).max(60_000).default(1000),
+  MATCHZY_RECONCILIATION_INTERVAL_MS: z.coerce
+    .number()
+    .int()
+    .min(5_000)
+    .max(300_000)
+    .default(30_000),
+  MATCHZY_STALE_AFTER_MS: z.coerce.number().int().min(30_000).default(120_000),
+});
+
+export type Environment = z.infer<typeof environmentSchema>;
+
+export function loadEnvironment(source: NodeJS.ProcessEnv = process.env): Environment {
+  const result = environmentSchema.safeParse(source);
+  if (!result.success) {
+    const fields = result.error.issues.map((issue) => issue.path.join('.')).join(', ');
+    throw new Error(`Invalid environment fields: ${fields}`);
+  }
+  return result.data;
+}

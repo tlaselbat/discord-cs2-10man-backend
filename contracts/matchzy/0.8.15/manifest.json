@@ -1,0 +1,9 @@
+{
+  "release_version": "0.8.15",
+  "git_tag": "0.8.15",
+  "git_commit_sha": "ef289d512766b89b0f7bf3088208ae88235e61fa",
+  "plugin_artifact_sha256": "425955d7565df84915dd6002d0a7848546d3859d376cb493f2988ed182586b57",
+  "linux_bundle_artifact_sha256": "2c5c2fa2208266278e213910fa30bf311cfb2f85c8fa961de1bb1e652933290a",
+  "required_counterstrikesharp_version": "1.0.342",
+  "contract_fixture_source_commit": "ef289d512766b89b0f7bf3088208ae88235e61fa"
+}
